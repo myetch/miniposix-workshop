@@ -21,6 +21,17 @@ No previous POSIX experience is required. A **file descriptor** is an integer ha
 4. In CLion, open **Settings → Build, Execution, Deployment → Toolchains** and add or select a local toolchain. Set **C Compiler** to `/usr/bin/clang-22` and **C++ Compiler** to `/usr/bin/clang++-22`, then apply the settings.
 5. In **Settings → Build, Execution, Deployment → CMake**, enable the `clang22-debug` preset if it is disabled. Select that preset before building.
 
+## Without CLion: Docker (terminal only)
+
+The [Dockerfile](Dockerfile) builds an Ubuntu 26.04 image with Clang 22, CMake, Ninja, GoogleTest, uv, and OpenCode. Docker Desktop on macOS or Windows, or Docker Engine on Linux, is enough; no GUI or IDE is needed. From the repository root:
+
+```bash
+docker build -t miniposix-workshop .
+docker run -it --name miniposix -v "$PWD":/work miniposix-workshop
+```
+
+Run every build, test, agent, and analysis command inside that container shell; the repository is mounted at `/work`, so edits are visible on both sides. Re-enter later with `docker start -ai miniposix`. Keep building inside the container only, because `build/` caches paths from the container. The benchmark plot is saved as a PNG in `bench-results/`; open it on the host. Under Docker Desktop the benchmark measures a Linux VM, so record that in your notes, and `perf stat` is usually unavailable there.
+
 Check your tools before starting:
 
 ```bash

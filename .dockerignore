@@ -1,0 +1,2 @@
+# The image installs tools only; the repository is mounted at run time.
+*
