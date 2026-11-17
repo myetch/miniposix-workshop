@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cstring>
 #include <cstddef>
 #include <cstdlib>
 #include <exception>
@@ -24,15 +26,27 @@
 namespace {
 
     constexpr std::size_t kMib = 1024 * 1024;
+    constexpr std::size_t kPatternPeriod = 251;
+
+    // baseline: computes and checks offset % 251 one byte at a time.
+    // table:    copies/compares slices of a precomputed repeating pattern with
+    //           memcpy/memcmp. Same bytes on the wire, same syscalls.
+    enum class Variant { baseline, table };
+
+    std::string_view variant_name(Variant variant) {
+        return variant == Variant::baseline ? "baseline" : "table";
+    }
 
     struct Options {
         std::filesystem::path output = "bench-results/pipe.csv";
         std::size_t total_bytes = 8 * kMib;
         std::size_t repeats = 3;
         std::vector<std::size_t> buffer_sizes = {512, 4096, 65536};
+        std::vector<Variant> variants = {Variant::baseline};
     };
 
     struct Result {
+        Variant variant;
         std::size_t buffer_bytes;
         std::size_t total_bytes;
         std::size_t repeat;
@@ -71,10 +85,32 @@ namespace {
         return values;
     }
 
+    std::vector<Variant> parse_variants(std::string_view text) {
+        std::vector<Variant> values;
+        while (true) {
+            const auto separator = text.find(',');
+            const auto piece = text.substr(0, separator);
+            if (piece == "baseline") {
+                values.push_back(Variant::baseline);
+            } else if (piece == "table") {
+                values.push_back(Variant::table);
+            } else {
+                throw std::invalid_argument("--variants accepts baseline and table");
+            }
+            if (separator == std::string_view::npos) {
+                break;
+            }
+            text.remove_prefix(separator + 1);
+        }
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+        return values;
+    }
+
     void usage(const char *program) {
         std::cout << "Usage: " << program
-                  << " [--output FILE] [--bytes N] [--repeats N] [--buffer-sizes N,N,...]\n"
-                  << "Defaults: bench-results/pipe.csv, 8388608 bytes, 3 repeats, 512,4096,65536 byte buffers\n";
+                  << " [--output FILE] [--bytes N] [--repeats N] [--buffer-sizes N,N,...] [--variants baseline,table]\n"
+                  << "Defaults: bench-results/pipe.csv, 8388608 bytes, 3 repeats, 512,4096,65536 byte buffers, baseline variant\n";
     }
 
     Options parse_options(int argc, char **argv) {
@@ -100,6 +136,8 @@ namespace {
                 options.repeats = positive_integer(value, option);
             } else if (option == "--buffer-sizes") {
                 options.buffer_sizes = parse_buffer_sizes(value);
+            } else if (option == "--variants") {
+                options.variants = parse_variants(value);
             } else {
                 throw std::invalid_argument("unknown option: " + std::string(option));
             }
@@ -111,13 +149,28 @@ namespace {
         return static_cast<unsigned char>(offset % 251);
     }
 
-    void write_exactly(int descriptor, std::size_t total_bytes, std::size_t buffer_bytes) {
+    // Pattern long enough that any slice starting at offset % 251 covers a
+    // full buffer: pattern[i] == byte_at(i) for every i.
+    std::vector<unsigned char> make_pattern(std::size_t buffer_bytes) {
+        std::vector<unsigned char> pattern(buffer_bytes + kPatternPeriod);
+        for (std::size_t index = 0; index < pattern.size(); ++index) {
+            pattern[index] = byte_at(index);
+        }
+        return pattern;
+    }
+
+    void write_exactly(Variant variant, int descriptor, std::size_t total_bytes, std::size_t buffer_bytes) {
         std::vector<unsigned char> buffer(buffer_bytes);
+        const auto pattern = variant == Variant::table ? make_pattern(buffer_bytes) : std::vector<unsigned char>{};
         std::size_t sent = 0;
         while (sent < total_bytes) {
             const auto count = std::min(buffer_bytes, total_bytes - sent);
-            for (std::size_t offset = 0; offset < count; ++offset) {
-                buffer[offset] = byte_at(sent + offset);
+            if (variant == Variant::table) {
+                std::memcpy(buffer.data(), pattern.data() + sent % kPatternPeriod, count);
+            } else {
+                for (std::size_t offset = 0; offset < count; ++offset) {
+                    buffer[offset] = byte_at(sent + offset);
+                }
             }
             std::size_t cursor = 0;
             while (cursor < count) {
@@ -137,8 +190,9 @@ namespace {
         }
     }
 
-    bool read_and_verify(int descriptor, std::size_t total_bytes, std::size_t buffer_bytes) {
+    bool read_and_verify(Variant variant, int descriptor, std::size_t total_bytes, std::size_t buffer_bytes) {
         std::vector<unsigned char> buffer(buffer_bytes);
+        const auto pattern = variant == Variant::table ? make_pattern(buffer_bytes) : std::vector<unsigned char>{};
         std::size_t received = 0;
         bool correct = true;
         while (received < total_bytes) {
@@ -153,9 +207,16 @@ namespace {
             if (read_count == 0) {
                 throw std::runtime_error("pipe reached EOF before the expected byte count");
             }
-            for (std::size_t offset = 0; offset < static_cast<std::size_t>(read_count); ++offset) {
-                if (buffer[offset] != byte_at(received + offset)) {
+            const auto got = static_cast<std::size_t>(read_count);
+            if (variant == Variant::table) {
+                if (std::memcmp(buffer.data(), pattern.data() + received % kPatternPeriod, got) != 0) {
                     correct = false;
+                }
+            } else {
+                for (std::size_t offset = 0; offset < got; ++offset) {
+                    if (buffer[offset] != byte_at(received + offset)) {
+                        correct = false;
+                    }
                 }
             }
             received += static_cast<std::size_t>(read_count);
@@ -163,7 +224,7 @@ namespace {
         return correct;
     }
 
-    Result measure(std::size_t total_bytes, std::size_t buffer_bytes, std::size_t repeat) {
+    Result measure(Variant variant, std::size_t total_bytes, std::size_t buffer_bytes, std::size_t repeat) {
         auto pipe = miniposix::Pipe::create();
         std::exception_ptr writer_failure;
         std::exception_ptr reader_failure;
@@ -172,14 +233,14 @@ namespace {
         const auto start = std::chrono::steady_clock::now();
         std::jthread writer([&] {
             try {
-                write_exactly(pipe.write_end().get(), total_bytes, buffer_bytes);
+                write_exactly(variant, pipe.write_end().get(), total_bytes, buffer_bytes);
             } catch (...) {
                 writer_failure = std::current_exception();
             }
             pipe.write_end().reset();
         });
         try {
-            correct = read_and_verify(pipe.read_end().get(), total_bytes, buffer_bytes);
+            correct = read_and_verify(variant, pipe.read_end().get(), total_bytes, buffer_bytes);
         } catch (...) {
             reader_failure = std::current_exception();
             // Release the reader so a failed run cannot leave the writer blocked.
@@ -202,7 +263,7 @@ namespace {
         if (seconds <= 0) {
             throw std::runtime_error("clock did not advance during measurement");
         }
-        return {buffer_bytes, total_bytes, repeat, seconds,
+        return {variant, buffer_bytes, total_bytes, repeat, seconds,
                 (static_cast<double>(total_bytes) / static_cast<double>(kMib)) / seconds};
     }
 
@@ -220,7 +281,9 @@ namespace {
         }
         file << std::setprecision(12);
         for (const auto &result: results) {
-            file << "miniposix_pipe," << result.buffer_bytes << ',' << result.total_bytes << ',' << result.seconds << ','
+            // Baseline keeps the original name so older CSVs stay comparable.
+            file << (result.variant == Variant::baseline ? "miniposix_pipe" : "miniposix_pipe_table") << ','
+                 << result.buffer_bytes << ',' << result.total_bytes << ',' << result.seconds << ','
                  << result.throughput_mib_s << ',' << result.repeat << '\n';
         }
         if (!file) {
@@ -240,10 +303,14 @@ int main(int argc, char **argv) {
         std::vector<Result> results;
         for (const auto buffer_bytes: options.buffer_sizes) {
             for (std::size_t repeat = 1; repeat <= options.repeats; ++repeat) {
-                const auto result = measure(options.total_bytes, buffer_bytes, repeat);
-                results.push_back(result);
-                std::cout << buffer_bytes << " bytes, repeat " << repeat << ": " << std::fixed
-                          << std::setprecision(2) << result.throughput_mib_s << " MiB/s\n";
+                // Variants alternate within each repeat so slow drift in system
+                // load affects them equally.
+                for (const auto variant: options.variants) {
+                    const auto result = measure(variant, options.total_bytes, buffer_bytes, repeat);
+                    results.push_back(result);
+                    std::cout << variant_name(variant) << ", " << buffer_bytes << " bytes, repeat " << repeat
+                              << ": " << std::fixed << std::setprecision(2) << result.throughput_mib_s << " MiB/s\n";
+                }
             }
         }
         save_results(options.output, results);
